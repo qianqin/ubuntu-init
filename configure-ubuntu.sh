@@ -1,4 +1,7 @@
 #!/bin/bash
+# Disable any aliases that might interfere with commands
+unalias sed 2>/dev/null || true
+unalias grep 2>/dev/null || true
 set -euo pipefail
 
 # Ubuntu Auto-Configuration Script
@@ -176,32 +179,33 @@ Unattended-Upgrade::Origins-Pattern {
     "${distro_id}:${distro_codename}-updates";
 };
 EOFORIGINS
-        return
+        return 0
     fi
     
     # Note: Backup should be done by caller before calling this function
     
     # Check if updates is already in Origins-Pattern (check for the pattern, not literal variable)
-    if grep -q '\${distro_id}:\${distro_codename}-updates' "$file"; then
-        return  # Already configured
+    if grep -q '\${distro_id}:\${distro_codename}-updates' "$file" 2>/dev/null; then
+        return 0  # Already configured
     fi
     
     # Check if Origins-Pattern block exists
-    if grep -q "Unattended-Upgrade::Origins-Pattern" "$file"; then
+    if grep -q "Unattended-Upgrade::Origins-Pattern" "$file" 2>/dev/null; then
         # Find the security line and add updates after it
         # Use a temporary file for safer editing
         local temp_file=$(mktemp)
         local in_block=false
         local added=false
         
-        while IFS= read -r line; do
-            if echo "$line" | grep -q "Unattended-Upgrade::Origins-Pattern"; then
+        # Read file line by line, handling files that don't end with newline
+        while IFS= read -r line || [ -n "$line" ]; do
+            if echo "$line" | grep -q "Unattended-Upgrade::Origins-Pattern" 2>/dev/null; then
                 in_block=true
             fi
             
             if [ "$in_block" = true ] && [ "$added" = false ]; then
                 # Check if this line contains the security pattern
-                if echo "$line" | grep -q '\${distro_codename}-security'; then
+                if echo "$line" | grep -q '\${distro_codename}-security' 2>/dev/null; then
                     echo "$line" >> "$temp_file"
                     echo '    "${distro_id}:${distro_codename}-updates";' >> "$temp_file"
                     added=true
@@ -209,7 +213,7 @@ EOFORIGINS
                 fi
                 
                 # Check if we hit the closing brace before finding security
-                if echo "$line" | grep -q "^};"; then
+                if echo "$line" | grep -q "^};" 2>/dev/null; then
                     if [ "$added" = false ]; then
                         # Add updates before closing brace
                         echo '    "${distro_id}:${distro_codename}-updates";' >> "$temp_file"
@@ -223,6 +227,7 @@ EOFORIGINS
         done < "$file"
         
         mv "$temp_file" "$file"
+        return 0
     else
         # Add Origins-Pattern block at the end
         echo "" >> "$file"
@@ -231,6 +236,7 @@ EOFORIGINS
         echo '    "${distro_id}:${distro_codename}-security";' >> "$file"
         echo '    "${distro_id}:${distro_codename}-updates";' >> "$file"
         echo "};" >> "$file"
+        return 0
     fi
 }
 
@@ -244,7 +250,14 @@ if [ -f "$UNATTENDED_FILE" ]; then
 fi
 
 # Ensure Origins-Pattern includes updates
+set +e  # Temporarily disable exit on error to catch the issue
 ensure_origins_pattern "$UNATTENDED_FILE"
+ORIGINS_EXIT=$?
+set -e  # Re-enable exit on error
+if [ $ORIGINS_EXIT -ne 0 ]; then
+    echo -e "${RED}Error in ensure_origins_pattern. Exit code: $ORIGINS_EXIT${NC}"
+    exit 1
+fi
 
 # Set specific configuration values (only what we need to change)
 set_apt_config "$UNATTENDED_FILE" "Unattended-Upgrade::Remove-Unused-Dependencies" "true" "Do automatic removal of new unused dependencies after the upgrade"
