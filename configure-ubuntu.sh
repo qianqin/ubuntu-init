@@ -132,14 +132,17 @@ set_apt_config() {
     
     # Remove existing lines that match the key (including commented ones)
     # Use simple string matching to avoid regex escaping issues
-    while IFS= read -r line; do
+    while IFS= read -r line || [ -n "$line" ]; do
         # Skip lines that contain the key
-        # First, remove leading whitespace
+        # Use parameter expansion to remove leading whitespace (more portable than sed)
         local temp_line="$line"
-        temp_line=$(echo "$temp_line" | sed 's/^[[:space:]]*//')
-        # Then check if it starts with // comment and remove it
-        if echo "$temp_line" | grep -q '^//'; then
-            temp_line=$(echo "$temp_line" | sed 's|^//[[:space:]]*||')
+        # Remove leading whitespace using parameter expansion
+        temp_line="${temp_line#"${temp_line%%[![:space:]]*}"}"
+        # Check if it starts with // comment and remove it
+        if [ "${temp_line#//}" != "$temp_line" ]; then
+            # Line starts with //, remove // and any following whitespace
+            temp_line="${temp_line#//}"
+            temp_line="${temp_line#"${temp_line%%[![:space:]]*}"}"
         fi
         # Check if the cleaned line starts with our key
         case "$temp_line" in
