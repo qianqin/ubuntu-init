@@ -127,14 +127,37 @@ set_apt_config() {
         touch "$file"
     fi
     
-    # Remove existing line (including commented ones that match)
-    sed -i "/^[[:space:]]*\(//[[:space:]]*\)\?${key}/d" "$file"
+    # Create temporary file for safer editing
+    local temp_file=$(mktemp)
+    
+    # Remove existing lines that match the key (including commented ones)
+    # Use simple string matching to avoid regex escaping issues
+    while IFS= read -r line; do
+        # Skip lines that contain the key
+        # First, remove leading whitespace
+        local temp_line="$line"
+        temp_line=$(echo "$temp_line" | sed 's/^[[:space:]]*//')
+        # Then check if it starts with // comment and remove it
+        if echo "$temp_line" | grep -q '^//'; then
+            temp_line=$(echo "$temp_line" | sed 's|^//[[:space:]]*||')
+        fi
+        # Check if the cleaned line starts with our key
+        case "$temp_line" in
+            "${key}"*)
+                continue
+                ;;
+        esac
+        echo "$line" >> "$temp_file"
+    done < "$file"
     
     # Add the new setting
     if [ -n "$comment" ]; then
-        echo "// ${comment}" >> "$file"
+        echo "// ${comment}" >> "$temp_file"
     fi
-    echo "${key} \"${value}\";" >> "$file"
+    echo "${key} \"${value}\";" >> "$temp_file"
+    
+    # Replace original file with temp file
+    mv "$temp_file" "$file"
 }
 
 # Function to ensure Origins-Pattern includes updates
