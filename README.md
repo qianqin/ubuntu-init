@@ -7,8 +7,10 @@ A one-liner script to configure a fresh Ubuntu installation with automatic updat
 Copy and paste this command into your terminal:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/qianqin/ubuntu-init/main/configure-ubuntu.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/qianqin/ubuntu-init/main/configure-ubuntu.sh?$(date +%s) | bash
 ```
+
+**Note:** The script will prompt for your sudo password once at the beginning. After configuring passwordless sudo, all subsequent commands will run without password prompts.
 
 ## Prerequisites
 

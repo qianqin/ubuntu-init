@@ -14,31 +14,58 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Check if running as root or with sudo
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}Error: This script must be run as root or with sudo${NC}"
-    exit 1
-fi
-
-# Detect the actual user (who invoked sudo)
+# Detect the actual user running the script
 ACTUAL_USER="${SUDO_USER:-${USER:-}}"
 if [ -z "$ACTUAL_USER" ] || [ "$ACTUAL_USER" = "root" ]; then
-    # Try to get the user from who am i or last command
-    ACTUAL_USER=$(who am i | awk '{print $1}' || echo "")
+    # Try to get the user from who am i or environment
+    ACTUAL_USER=$(who am i 2>/dev/null | awk '{print $1}' || echo "${USER:-}")
 fi
+
+# If running as root directly, try to find the actual user
+if [ "$EUID" -eq 0 ] && [ -z "$SUDO_USER" ]; then
+    # Check if we can determine the user from login session
+    ACTUAL_USER=$(logname 2>/dev/null || echo "")
+    if [ -z "$ACTUAL_USER" ] || [ "$ACTUAL_USER" = "root" ]; then
+        # Try last logged in user
+        ACTUAL_USER=$(last -w 2>/dev/null | head -n1 | awk '{print $1}' || echo "")
+    fi
+fi
+
+# Check if we need sudo access
+NEED_SUDO=false
+if [ "$EUID" -ne 0 ]; then
+    NEED_SUDO=true
+    # Test if we have sudo access (will prompt for password if needed)
+    if ! sudo -n true 2>/dev/null; then
+        echo -e "${YELLOW}This script requires sudo access. Please enter your password:${NC}"
+        sudo -v || {
+            echo -e "${RED}Error: Sudo access required${NC}"
+            exit 1
+        }
+    fi
+fi
+
+# Function to run commands with or without sudo
+run_as_root() {
+    if [ "$NEED_SUDO" = true ]; then
+        sudo "$@"
+    else
+        "$@"
+    fi
+}
 
 echo -e "${GREEN}Starting Ubuntu auto-configuration...${NC}"
 
 # Function to backup file if it exists
 backup_file() {
     local file="$1"
-    if [ -f "$file" ]; then
-        cp "$file" "${file}.bak.$(date +%Y%m%d_%H%M%S)"
+    if run_as_root [ -f "$file" ]; then
+        run_as_root cp "$file" "${file}.bak.$(date +%Y%m%d_%H%M%S)"
         echo -e "${YELLOW}Backed up $file${NC}"
     fi
 }
 
-# Configure sudo nopasswd for sudo group
+# Configure sudo nopasswd for sudo group FIRST (so subsequent sudo commands don't need password)
 echo -e "${GREEN}Configuring sudo nopasswd for sudo group...${NC}"
 MAIN_SUDOERS="/etc/sudoers"
 SUDOERS_DROPIN="/etc/sudoers.d/99-sudo-group-nopasswd"
@@ -48,60 +75,70 @@ SUDOERS_LINE="%sudo ALL=(ALL:ALL) NOPASSWD: ALL"
 validate_sudoers() {
     local file="$1"
     if command -v visudo >/dev/null 2>&1; then
-        visudo -cf "$file" >/dev/null 2>&1
+        run_as_root visudo -cf "$file" >/dev/null 2>&1
     else
         # Fallback: basic syntax check
-        grep -q "^%sudo" "$file" 2>/dev/null
+        run_as_root grep -q "^%sudo" "$file" 2>/dev/null
     fi
 }
 
 # Check if NOPASSWD is already configured in main sudoers file
-if grep -qE "^%sudo.*NOPASSWD.*ALL" "$MAIN_SUDOERS" 2>/dev/null; then
+if run_as_root grep -qE "^%sudo.*NOPASSWD.*ALL" "$MAIN_SUDOERS" 2>/dev/null; then
     echo -e "${YELLOW}✓ Sudo nopasswd configuration already exists in $MAIN_SUDOERS${NC}"
 # Check if sudo group line exists in main sudoers (without NOPASSWD)
-elif grep -qE "^%sudo[[:space:]]+ALL=\(ALL:ALL\)[[:space:]]+ALL" "$MAIN_SUDOERS" 2>/dev/null; then
+elif run_as_root grep -qE "^%sudo[[:space:]]+ALL=\(ALL:ALL\)[[:space:]]+ALL" "$MAIN_SUDOERS" 2>/dev/null; then
     # Modify the existing line in main sudoers file
-    backup_file "$MAIN_SUDOERS"
+    run_as_root cp "$MAIN_SUDOERS" "${MAIN_SUDOERS}.bak.$(date +%Y%m%d_%H%M%S)"
+    echo -e "${YELLOW}Backed up $MAIN_SUDOERS${NC}"
     
     # Replace the sudo group line to add NOPASSWD
-    sed -i 's/^%sudo[[:space:]]*ALL=(ALL:ALL)[[:space:]]*ALL/%sudo ALL=(ALL:ALL) NOPASSWD: ALL/' "$MAIN_SUDOERS"
+    run_as_root sed -i 's/^%sudo[[:space:]]*ALL=(ALL:ALL)[[:space:]]*ALL/%sudo ALL=(ALL:ALL) NOPASSWD: ALL/' "$MAIN_SUDOERS"
     
     # Validate the change
     if validate_sudoers "$MAIN_SUDOERS"; then
         echo -e "${GREEN}✓ Modified sudo group line in $MAIN_SUDOERS to enable nopasswd${NC}"
+        # Refresh sudo credentials so subsequent commands don't need password
+        if [ "$NEED_SUDO" = true ]; then
+            sudo -v
+        fi
     else
         echo -e "${RED}Error: sudoers file validation failed. Restoring backup...${NC}"
         # Find the most recent backup and restore it
-        LATEST_BACKUP=$(ls -t "${MAIN_SUDOERS}.bak."* 2>/dev/null | head -n1)
-        if [ -n "$LATEST_BACKUP" ] && [ -f "$LATEST_BACKUP" ]; then
-            mv "$LATEST_BACKUP" "$MAIN_SUDOERS"
+        LATEST_BACKUP=$(run_as_root ls -t "${MAIN_SUDOERS}.bak."* 2>/dev/null | head -n1)
+        if [ -n "$LATEST_BACKUP" ] && run_as_root [ -f "$LATEST_BACKUP" ]; then
+            run_as_root mv "$LATEST_BACKUP" "$MAIN_SUDOERS"
             echo -e "${YELLOW}Backup restored. Please check sudoers file manually.${NC}"
         fi
         exit 1
     fi
 # Check if already configured in drop-in file
-elif [ -f "$SUDOERS_DROPIN" ] && grep -qE "^%sudo.*NOPASSWD.*ALL" "$SUDOERS_DROPIN" 2>/dev/null; then
+elif run_as_root [ -f "$SUDOERS_DROPIN" ] && run_as_root grep -qE "^%sudo.*NOPASSWD.*ALL" "$SUDOERS_DROPIN" 2>/dev/null; then
     echo -e "${YELLOW}✓ Sudo nopasswd configuration already exists in $SUDOERS_DROPIN${NC}"
 else
     # No sudo group line found - create drop-in file
-    if [ -f "$SUDOERS_DROPIN" ]; then
-        backup_file "$SUDOERS_DROPIN"
+    if run_as_root [ -f "$SUDOERS_DROPIN" ]; then
+        run_as_root cp "$SUDOERS_DROPIN" "${SUDOERS_DROPIN}.bak.$(date +%Y%m%d_%H%M%S)"
+        echo -e "${YELLOW}Backed up $SUDOERS_DROPIN${NC}"
         # Remove any existing sudo group line
-        sed -i '/^%sudo.*ALL=/d' "$SUDOERS_DROPIN"
+        run_as_root sed -i '/^%sudo.*ALL=/d' "$SUDOERS_DROPIN"
     else
-        touch "$SUDOERS_DROPIN"
+        run_as_root touch "$SUDOERS_DROPIN"
     fi
     
     # Add our line to drop-in file
-    echo "$SUDOERS_LINE" >> "$SUDOERS_DROPIN"
-    chmod 0440 "$SUDOERS_DROPIN"
+    echo "$SUDOERS_LINE" | run_as_root tee -a "$SUDOERS_DROPIN" > /dev/null
+    run_as_root chmod 0440 "$SUDOERS_DROPIN"
     
     # Validate the drop-in file
     if validate_sudoers "$SUDOERS_DROPIN"; then
         echo -e "${GREEN}✓ Created sudo nopasswd configuration in $SUDOERS_DROPIN${NC}"
+        # Refresh sudo credentials so subsequent commands don't need password
+        if [ "$NEED_SUDO" = true ]; then
+            sudo -v
+        fi
     else
         echo -e "${RED}Error: sudoers drop-in file validation failed. Removing...${NC}"
-        rm -f "$SUDOERS_DROPIN"
+        run_as_root rm -f "$SUDOERS_DROPIN"
         exit 1
     fi
 fi
@@ -110,8 +147,8 @@ fi
 if ! command -v unattended-upgrade &> /dev/null; then
     echo -e "${GREEN}Installing unattended-upgrades...${NC}"
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    apt-get install -y -qq unattended-upgrades
+    run_as_root apt-get update -qq
+    run_as_root apt-get install -y -qq unattended-upgrades
     echo -e "${GREEN}✓ Installed unattended-upgrades${NC}"
 else
     echo -e "${YELLOW}✓ unattended-upgrades already installed${NC}"
@@ -126,11 +163,11 @@ set_apt_config() {
     local comment="${4:-}"
     
     # Create file if it doesn't exist
-    if [ ! -f "$file" ]; then
-        touch "$file"
+    if ! run_as_root [ -f "$file" ]; then
+        run_as_root touch "$file"
     fi
     
-    # Create temporary file for safer editing
+    # Create temporary file for safer editing (in user's temp directory)
     local temp_file=$(mktemp)
     
     # Remove existing lines that match the key (including commented ones)
@@ -154,7 +191,7 @@ set_apt_config() {
                 ;;
         esac
         echo "$line" >> "$temp_file"
-    done < "$file"
+    done < <(run_as_root cat "$file")
     
     # Add the new setting
     if [ -n "$comment" ]; then
@@ -163,7 +200,8 @@ set_apt_config() {
     echo "${key} \"${value}\";" >> "$temp_file"
     
     # Replace original file with temp file
-    mv "$temp_file" "$file"
+    run_as_root cp "$temp_file" "$file"
+    rm -f "$temp_file"
 }
 
 # Function to ensure Origins-Pattern includes updates
@@ -171,8 +209,8 @@ ensure_origins_pattern() {
     local file="$1"
     
     # Create basic file structure if it doesn't exist
-    if [ ! -f "$file" ]; then
-        cat > "$file" << 'EOFORIGINS'
+    if ! run_as_root [ -f "$file" ]; then
+        run_as_root tee "$file" > /dev/null << 'EOFORIGINS'
 Unattended-Upgrade::Origins-Pattern {
     "${distro_id}:${distro_codename}";
     "${distro_id}:${distro_codename}-security";
@@ -185,12 +223,12 @@ EOFORIGINS
     # Note: Backup should be done by caller before calling this function
     
     # Check if updates is already in Origins-Pattern (check for the pattern, not literal variable)
-    if grep -q '\${distro_id}:\${distro_codename}-updates' "$file" 2>/dev/null; then
+    if run_as_root grep -q '\${distro_id}:\${distro_codename}-updates' "$file" 2>/dev/null; then
         return 0  # Already configured
     fi
     
     # Check if Origins-Pattern block exists
-    if grep -q "Unattended-Upgrade::Origins-Pattern" "$file" 2>/dev/null; then
+    if run_as_root grep -q "Unattended-Upgrade::Origins-Pattern" "$file" 2>/dev/null; then
         # Find the security line and add updates after it
         # Use a temporary file for safer editing
         local temp_file=$(mktemp)
@@ -224,18 +262,21 @@ EOFORIGINS
             fi
             
             echo "$line" >> "$temp_file"
-        done < "$file"
+        done < <(run_as_root cat "$file")
         
-        mv "$temp_file" "$file"
+        run_as_root cp "$temp_file" "$file"
+        rm -f "$temp_file"
         return 0
     else
         # Add Origins-Pattern block at the end
-        echo "" >> "$file"
-        echo "Unattended-Upgrade::Origins-Pattern {" >> "$file"
-        echo '    "${distro_id}:${distro_codename}";' >> "$file"
-        echo '    "${distro_id}:${distro_codename}-security";' >> "$file"
-        echo '    "${distro_id}:${distro_codename}-updates";' >> "$file"
-        echo "};" >> "$file"
+        {
+            echo ""
+            echo "Unattended-Upgrade::Origins-Pattern {"
+            echo '    "${distro_id}:${distro_codename}";'
+            echo '    "${distro_id}:${distro_codename}-security";'
+            echo '    "${distro_id}:${distro_codename}-updates";'
+            echo "};"
+        } | run_as_root tee -a "$file" > /dev/null
         return 0
     fi
 }
@@ -245,7 +286,7 @@ echo -e "${GREEN}Configuring unattended-upgrades...${NC}"
 UNATTENDED_FILE="/etc/apt/apt.conf.d/50unattended-upgrades"
 
 # Backup once before making any changes
-if [ -f "$UNATTENDED_FILE" ]; then
+if run_as_root [ -f "$UNATTENDED_FILE" ]; then
     backup_file "$UNATTENDED_FILE"
 fi
 
@@ -273,7 +314,7 @@ echo -e "${GREEN}Configuring automatic upgrades...${NC}"
 AUTO_UPGRADES_FILE="/etc/apt/apt.conf.d/20auto-upgrades"
 
 # Backup once before making any changes
-if [ -f "$AUTO_UPGRADES_FILE" ]; then
+if run_as_root [ -f "$AUTO_UPGRADES_FILE" ]; then
     backup_file "$AUTO_UPGRADES_FILE"
 fi
 
@@ -287,14 +328,14 @@ echo -e "${GREEN}✓ Configured automatic upgrades${NC}"
 
 # Enable and start unattended-upgrades service
 echo -e "${GREEN}Enabling unattended-upgrades service...${NC}"
-systemctl enable unattended-upgrades
-systemctl restart unattended-upgrades
+run_as_root systemctl enable unattended-upgrades
+run_as_root systemctl restart unattended-upgrades
 echo -e "${GREEN}✓ Enabled and started unattended-upgrades service${NC}"
 
 # Run initial cleanup
 echo -e "${GREEN}Running initial cleanup...${NC}"
-apt-get autoremove -y -qq
-apt-get autoclean -qq
+run_as_root apt-get autoremove -y -qq
+run_as_root apt-get autoclean -qq
 echo -e "${GREEN}✓ Completed initial cleanup${NC}"
 
 # SSH Key Management
@@ -307,7 +348,10 @@ if [ -n "$ACTUAL_USER" ] && [ "$ACTUAL_USER" != "root" ]; then
     # Create .ssh directory if it doesn't exist
     if [ ! -d "$SSH_DIR" ]; then
         mkdir -p "$SSH_DIR"
-        chown "$ACTUAL_USER:$ACTUAL_USER" "$SSH_DIR"
+        # chown only needed if we're running as root
+        if [ "$EUID" -eq 0 ]; then
+            chown "$ACTUAL_USER:$ACTUAL_USER" "$SSH_DIR"
+        fi
         chmod 700 "$SSH_DIR"
     fi
     
@@ -332,7 +376,10 @@ if [ -n "$ACTUAL_USER" ] && [ "$ACTUAL_USER" != "root" ]; then
             # Validate it looks like an SSH public key (basic check)
             if echo "$PUB_KEY" | grep -qE "^(ssh-rsa|ssh-ed25519|ecdsa-sha2|ssh-dss) "; then
                 echo "$PUB_KEY" >> "$AUTHORIZED_KEYS"
-                chown "$ACTUAL_USER:$ACTUAL_USER" "$AUTHORIZED_KEYS"
+                # chown only needed if we're running as root
+                if [ "$EUID" -eq 0 ]; then
+                    chown "$ACTUAL_USER:$ACTUAL_USER" "$AUTHORIZED_KEYS"
+                fi
                 chmod 600 "$AUTHORIZED_KEYS"
                 echo -e "${GREEN}✓ Added SSH public key for user $ACTUAL_USER${NC}"
             else
@@ -358,24 +405,26 @@ if [ -n "$ACTUAL_USER" ] && [ "$ACTUAL_USER" != "root" ]; then
             backup_file "$SSHD_CONFIG"
             
             # Check if PasswordAuthentication is already configured
-            if grep -qE "^PasswordAuthentication" "$SSHD_CONFIG"; then
+            if run_as_root grep -qE "^PasswordAuthentication" "$SSHD_CONFIG"; then
                 # Update existing setting
-                sed -i 's/^PasswordAuthentication.*/PasswordAuthentication no/' "$SSHD_CONFIG"
+                run_as_root sed -i 's/^PasswordAuthentication.*/PasswordAuthentication no/' "$SSHD_CONFIG"
             else
                 # Add new setting at the end
-                echo "" >> "$SSHD_CONFIG"
-                echo "# Disable password authentication (configured by ubuntu-init)" >> "$SSHD_CONFIG"
-                echo "PasswordAuthentication no" >> "$SSHD_CONFIG"
+                {
+                    echo ""
+                    echo "# Disable password authentication (configured by ubuntu-init)"
+                    echo "PasswordAuthentication no"
+                } | run_as_root tee -a "$SSHD_CONFIG" > /dev/null
             fi
             
             # Also ensure PubkeyAuthentication is enabled (should be default, but be explicit)
-            if ! grep -qE "^PubkeyAuthentication" "$SSHD_CONFIG"; then
-                echo "PubkeyAuthentication yes" >> "$SSHD_CONFIG"
+            if ! run_as_root grep -qE "^PubkeyAuthentication" "$SSHD_CONFIG"; then
+                echo "PubkeyAuthentication yes" | run_as_root tee -a "$SSHD_CONFIG" > /dev/null
             fi
             
             # Restart SSH service
-            if systemctl is-active --quiet sshd || systemctl is-active --quiet ssh; then
-                systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+            if run_as_root systemctl is-active --quiet sshd 2>/dev/null || run_as_root systemctl is-active --quiet ssh 2>/dev/null; then
+                run_as_root systemctl restart sshd 2>/dev/null || run_as_root systemctl restart ssh 2>/dev/null || true
                 echo -e "${GREEN}✓ Disabled password authentication for SSH and restarted SSH service${NC}"
                 echo -e "${YELLOW}⚠️  Important: Make sure you can SSH in with your key before closing this session!${NC}"
             else
